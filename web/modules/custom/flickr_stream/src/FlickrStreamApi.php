@@ -2,20 +2,81 @@
 
 namespace Drupal\flickr_stream;
 
-use Drupal;
 use GuzzleHttp\Exception\ClientException;
 use Drupal\Component\Utility\NestedArray;
 use Drupal\Core\Url;
+use Drupal\Core\Config\ConfigFactoryInterface;
+use GuzzleHttp\ClientInterface;
+use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 
 /**
  * Class FlickrStreamApi.
  *
  * @package Drupal\FlickrStreamApi
  */
-class FlickrStreamApi {
+class FlickrStreamApi implements ContainerInjectionInterface {
 
+  /**
+   * Flickr API services endpoint.
+   */
   const FLICKR_API_URL = 'https://api.flickr.com/services/rest/';
+
+  /**
+   * Flickr module config.
+   *
+   * @var array
+   */
   protected $flickrConf;
+  /**
+   * Plugin configuration.
+   *
+   * @var \Drupal\Core\Config\ConfigFactoryInterface
+   */
+  protected $configFactory;
+
+  /**
+   * HTTP client.
+   *
+   * @var \GuzzleHttp\ClientInterface
+   */
+  protected $client;
+
+  /**
+   * Used for logging errors.
+   *
+   * @var \Drupal\Core\Logger\LoggerChannelFactoryInterface
+   */
+  protected $logger;
+
+  /**
+   * FlickrStreamApi constructor.
+   *
+   * @param \Drupal\Core\Config\ConfigFactoryInterface $config_factory
+   *   Plugin configuration.
+   * @param \GuzzleHttp\ClientInterface $http_client
+   *   HTTP client.
+   * @param \Drupal\Core\Logger\LoggerChannelFactoryInterface $logger
+   *   Used for logging errors.
+   */
+  public function __construct(ConfigFactoryInterface $config_factory, ClientInterface $http_client, LoggerChannelFactoryInterface $logger) {
+    $this->configFactory = $config_factory;
+    $this->client = $http_client;
+    $this->logger = $logger;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public static function create(ContainerInterface $container) {
+    return new static(
+      $container->get('config.factory'),
+      $container->get('http_client'),
+      $container->get('logger.factory')
+    );
+  }
+
 
   /**
    * Returns generic default configuration for flickr api.
@@ -24,7 +85,7 @@ class FlickrStreamApi {
    *   An associative array with the default configuration.
    */
   protected function baseConfigurationDefaults() {
-    $flickConfig = Drupal::config('flickr_stream.settings');
+    $flickConfig = $this->configFactory->get('flickr_stream.settings');
     return [
       'api_key' => $flickConfig->get('flickr_stream_api_key'),
       'default_count' => $flickConfig->get('flickr_stream_photo_count'),
@@ -85,33 +146,48 @@ class FlickrStreamApi {
    * @param array $image_style
    *   Images output style.
    *
-   * @return string
+   * @return array
    *   Build images render html.
    */
   public function flickrBuildImages(array $flickrImages, $apiType, array $image_style) {
-    $images_markup = '';
+    $build = [];
+    $list = [];
     // Detect flickr images type.
     $flickr_array = ($apiType == 'album') ? $flickrImages['photoset']['photo'] : $flickrImages['photos']['photo'];
-    $images_markup .= '<div class="flick-image-wrapper">';
     foreach ($flickr_array as $index => $flickr_photo) {
       switch ($image_style['flickr_images_style']) {
         case 'default':
-          $cached_images = imagecache_external_generate_path($this::generatePhotoUri($flickr_photo));
-          $images_markup .= '<div class="flickr-image" ><img src="' . file_create_url($cached_images) . '" alt="' . $flickr_photo['title'] . '" /></div>';
+          $list[] = [
+            '#theme' => 'flickr_image',
+            '#uri' => imagecache_external_generate_path($this::generatePhotoUri($flickr_photo)),
+            '#alt' => $flickr_photo['title'],
+          ];
           break;
 
         default:
-          $cached_images = [
-            '#theme' => 'imagecache_external',
-            '#style_name' => $image_style['flickr_images_style'],
-            '#uri' => $this::generatePhotoUri($flickr_photo),
+          $style = ImageStyle::load($image_style['flickr_images_style']);
+          $generated_uri = imagecache_external_generate_path($this::generatePhotoUri($flickr_photo));
+          $styled_uri = $style->buildUrl($generated_uri);
+          $list[] = [
+            '#theme' => 'flickr_image',
+            '#uri' => $styled_uri,
             '#alt' => $flickr_photo['title'],
           ];
-          $images_markup .= '<div class="flickr-image" >' . render($cached_images) . '</div>';
       }
     }
-    $images_markup .= '</div>';
-    return $images_markup;
+
+    $build[] = [
+      '#theme' => 'item_list',
+      '#items' => $list,
+      '#cache' => [
+        'contexts' => ['session'],
+        'tags' => [],
+        'max-age' => Cache::PERMANENT,
+      ],
+      '#list_type' => 'ul',
+      '#attributes' => ['class' => 'flickr-image-list'],
+    ];
+    return $build;
   }
 
   /**
@@ -125,9 +201,8 @@ class FlickrStreamApi {
    */
   public function getAlbumPhotos(array $conf) {
     $flickr_results = [];
-    $client = Drupal::httpClient();
     try {
-      $request = $client->get($conf['uri'], [
+      $request = $this->client->get($conf['uri'], [
         'query' => [
           'method' => 'flickr.photosets.getPhotos',
           'api_key' => $conf['api_key'],
@@ -141,15 +216,15 @@ class FlickrStreamApi {
       $response = $request->getBody();
       $flickr_results = json_decode($response->read($response->getSize()), TRUE);
       if ($flickr_results['stat'] == 'fail') {
-        Drupal::logger('flickr_stream')->notice('Flickr api get @errorId error with message: @errorMessage', [
+        $this->logger->get('flickr_stream')->notice('Flickr api get @errorId error with message: @errorMessage', [
           '@errorId' => $flickr_results['stat'],
           '@errorMessage' => $flickr_results['message'],
         ]);
       }
     }
     catch (ClientException $exception) {
-      Drupal::logger('flickr_stream')->notice($exception);
-      Drupal::logger('flickr_stream')->alert('Please check flickrs credentials and flickr fields inputs. Go to logs for more information');
+      $this->logger->get('flickr_stream')->notice($exception);
+      $this->logger->get('flickr_stream')->alert('Please check flickrs credentials and flickr fields inputs. Go to logs for more information');
     }
     return $flickr_results;
   }
@@ -165,9 +240,8 @@ class FlickrStreamApi {
    */
   public function getUserPhotos(array $conf) {
     $flickr_results = [];
-    $client = Drupal::httpClient();
     try {
-      $request = $client->get($conf['uri'], [
+      $request = $this->client->get($conf['uri'], [
         'query' => [
           'method' => 'flickr.people.getPublicPhotos',
           'api_key' => $conf['api_key'],
@@ -180,15 +254,15 @@ class FlickrStreamApi {
       $response = $request->getBody();
       $flickr_results = json_decode($response->read($response->getSize()), TRUE);
       if ($flickr_results['stat'] == 'fail') {
-        Drupal::logger('flickr_stream')->notice('Flickr api get @errorId error with message: @errorMessage', [
+        $this->logger->get('flickr_stream')->notice('Flickr api get @errorId error with message: @errorMessage', [
           '@errorId' => $flickr_results['stat'],
           '@errorMessage' => $flickr_results['message'],
         ]);
       }
     }
     catch (ClientException $exception) {
-      Drupal::logger('flickr_stream')->notice($exception);
-      Drupal::logger('flickr_stream')->alert('Please check flickrs credentials and flickr fields inputs. Go to logs for more information');
+      $this->logger->get('flickr_stream')->notice($exception);
+      $this->logger->get('flickr_stream')->alert('Please check flickrs credentials and flickr fields inputs. Go to logs for more information');
     }
     return $flickr_results;
   }

@@ -6,6 +6,7 @@ use Drupal\Core\Block\BlockBase;
 use Drupal\Core\Form\FormStateInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\image\Entity\ImageStyle;
 use Drupal\flickr_stream\FlickrStreamApi;
 use Drupal\Core\Cache\Cache;
@@ -33,11 +34,19 @@ class FlickrStreamBlock extends BlockBase implements ContainerFactoryPluginInter
   protected $flickrApi;
 
   /**
+   * The config factory.
+   *
+   * @var \Drupal\Core\Config\ConfigFactoryInterface
+   */
+  protected $configFactory;
+
+  /**
    * {@inheritdoc}
    */
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, FlickrStreamApi $flickrApi) {
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, FlickrStreamApi $flickrApi, ConfigFactoryInterface $config_factory) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
     $this->flickrApi = $flickrApi;
+    $this->configFactory = $config_factory;
   }
 
   /**
@@ -48,7 +57,8 @@ class FlickrStreamBlock extends BlockBase implements ContainerFactoryPluginInter
       $configuration,
       $plugin_id,
       $plugin_definition,
-      $container->get('flickr.stream.api')
+      $container->get('flickr.stream.api'),
+      $container->get('config.factory')
     );
   }
 
@@ -77,7 +87,7 @@ class FlickrStreamBlock extends BlockBase implements ContainerFactoryPluginInter
       $styles[$style] = ucfirst($style);
     }
 
-    $config = \Drupal::config('flickr_stream.settings');
+    $config = $this->configFactory->get('flickr_stream.settings');
 
     // Flickr user ID.
     $form['flickr_user_id'] = [
@@ -226,15 +236,17 @@ class FlickrStreamBlock extends BlockBase implements ContainerFactoryPluginInter
     }
     else {
       $photos = $conf['flickr_photoset_id'] ? $response['photoset']['photo'] : $response['photos']['photo'];
-      $style = ($conf['flickr_image_style'] != 'default') ? $conf['flickr_image_style'] : '';
+      $style_name = ($conf['flickr_image_style'] != 'default') ? $conf['flickr_image_style'] : '';
+      $style = ImageStyle::load($style_name);
       foreach ($photos as $key => $photo) {
         $photo_uri = $this->flickrApi->generatePhotoUri($photo);
         if ($style) {
+          $generated_uri = imagecache_external_generate_path($photo_uri);
+          $styled_uri = $style->buildUrl($generated_uri);
           $list[$key] = [
-            '#theme' => 'imagecache_external',
-            '#uri' => $photo_uri,
+            '#theme' => 'flickr_image',
+            '#uri' => $styled_uri,
             '#alt' => $photo['title'],
-            '#style_name' => $style,
             '#attributes' => [
               'class' => $conf['flickr_image_class'],
             ],
@@ -242,7 +254,7 @@ class FlickrStreamBlock extends BlockBase implements ContainerFactoryPluginInter
         }
         else {
           $list[$key] = [
-            '#theme' => 'image',
+            '#theme' => 'flickr_image',
             '#uri' => imagecache_external_generate_path($photo_uri),
             '#alt' => $photo['title'],
             '#attributes' => [
